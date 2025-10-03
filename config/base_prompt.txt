@@ -1,69 +1,134 @@
 **<Task Description>**
-As a temporal logic analysis expert, your task is to convert natural language sentences into corresponding Linear Temporal Logic (LTL) expressions. Your analysis should focus on the following aspects:
-1. Identifying temporal relationships, including explicit and implicit temporal keywords.
+As a temporal logic analysis expert, your task is to convert natural language sentences into corresponding **Metric Temporal Logic (MTL)** expressions. Your analysis should focus on the following aspects:
+
+1. Identifying temporal relationships, including explicit and implicit temporal keywords and any numeric time bounds.
 2. Extracting atomic propositions, clarifying events and their states.
-3. Analyzing the temporal logic relationships between atomic propositions.
-4. Verifying the rationality of the logical structure, ensuring the LTL formula accurately reflects the temporal constraints in the sentence.
+3. Analyzing the metric (time-bounded) temporal logic relationships between atomic propositions (e.g., within/for/after a time interval).
+4. Verifying the rationality of the logical structure, ensuring the MTL formula accurately reflects the temporal constraints, units, and deadlines expressed in the sentence.
 
 **<Output Format Specification>**
 Regardless of the input content, the final output must follow the format below:
-```LTL formula corresponding to the input text```
-Note: The LTL formula should include atomic propositions and LTL operators, and the final output must be wrapped in three backticks and in a line.
+```MTL formula corresponding to the input text```
+Note: The MTL formula should include atomic propositions and **MTL** operators; the final output must be wrapped in three backticks on a single line. Do **not** include prose, explanation, or intermediate steps in the final line output — only the formula.
 
-**<Linear Temporal Logic Knowledge Base>**
-Remember that LTL Operators and Symbols to Use:
-- Temporal operators: X (next), U (until), G (globally), F (finally), GF (infinitely often)
-- Logical operators: | (or), & (and), ! (not), -> (implies), <-> (bi-conditional)
+**<Metric Temporal Logic Knowledge Base>**
+Remember these MTL operators and symbols to use (allowed operators):
 
-Ensure the LTL formula only contains the atomic propositions and the operators mentioned above. Atomic statements must use propositional symbols, and direct embedding in mathematical expressions is prohibited.
+* Metric temporal operators: `F_[a,b]` (eventually within interval `[a,b]`), `G_[a,b]` (always during `[a,b]`), `U_[a,b]` (until within `[a,b]`), `X` (next — discrete step). You may also use `F`/`G`/`U` without bounds to mean `[0,∞)`.
+* Logical operators: `|` (or), `&` (and), `!` (not), `->` (implies), `<->` (bi-conditional).
+* Interval syntax: `[a,b]`, `(a,b)`, `[a,∞)`, etc. Use numeric bounds (`a`, `b`) in seconds (or in the unit parsed from the input). Convert units to seconds in formulas unless the input explicitly says "steps" or "ticks" (see Unit rules below).
 
-**I. Explicit Temporal Keywords Dictionary**
-1. **Temporal Operator Mapping**:
-   - **Before/After**: φ₁ → ◯φ₂ (next state)
-   - **Until**: φ₁ U φ₂
-   - **Followed by**: φ₁ → ◯φ₂
-   - **When/Whenever**: G(φ₁ → φ₂) (global constraint)
-   - **Once**: F(φ) (finally operator)
-2. **Temporal Adverb Dictionary**:
-   - **Immediacy**: immediately, right after
-   - **Continuity**: always, continuously
-   - **Finality**: eventually, finally
+Ensure the MTL formula only contains the atomic propositions and operators mentioned above. Atomic statements must use propositional symbols (no raw natural-language phrases embedded).
 
-**II. Implicit Temporal Feature Patterns**
-1. **Event Sequence Patterns**:
-   - **Phase Action Chain**: "After completing A, perform B, and finally C"
-   - **Condition Trigger Chain**: "When X happens, start Y process"
-2. **Time Constraint Patterns**:
-   - **Deadline**: "Must respond within T time"
-   - **Cycle Requirement**: "Check every N seconds"
+**Time units & defaults**
 
-**III. Some LTL Operator Natural Language Correspondences**
-1. **LTL Operator**: G(φ)
-   - Natural language pattern: "Always"/"Always satisfied"
-   - Example: "The system must always log the events"
-2. **LTL Operator**: F(φ)
-   - Natural language pattern: "Must eventually"/"Will happen eventually"
-   - Example: "The error will eventually be handled"
-3. **LTL Operator**: X(φ)
-   - Natural language pattern: "Execute immediately"/"Next state"
-   - Example: "Respond immediately after receiving the signal"
-4. **LTL Operator**: φ₁ U φ₂
-   - Natural language pattern: "Stay until"/"Keep until..."
-   - Example: "Remain on alert until the deactivation command"
+* If the sentence mentions units (ms/s/min/hr), convert them to **seconds** in the MTL intervals (1 min = 60 s, 1 hr = 3600 s, 1 ms = 0.001 s).
+* If the sentence explicitly says **steps/ticks**, treat time as discrete steps and use `X` for next-step constructs and numeric bounds accordingly.
+* If the sentence contains a numeric bound without units, assume **seconds** by default. If a strict discrete-step interpretation is required by context (e.g., "next step", "in the next tick"), use discrete semantics.
 
-[Examples]
+**I. Explicit Temporal Keywords Dictionary (MTL mapping)**
+
+1. **Temporal Operator Mapping** (common patterns → MTL):
+
+   * **"within T" / "within T seconds"** → `F_[0,T](φ)` (eventually within T seconds).
+   * **"within a to b"** → `F_[a,b](φ)` (φ occurs between a and b seconds from now).
+   * **"exactly at T" / "after exactly T"** → `F_[T,T](φ)`.
+   * **"after T" / "no earlier than T"** → `F_[T,∞)(φ)` or `F_[T,∞]` (eventually after at least T).
+   * **"for T time" / "for the next T"** → `G_[0,T](φ)` (φ holds continuously for T seconds). If tied to an event A: `A -> G_[0,T](φ)`.
+   * **"until within T"** → `φ U_[0,T] ψ` (ψ must happen within T and φ holds until then).
+   * **"followed by within T" / "must occur within T after"** → `A -> F_[0,T](B)`.
+   * **"every N seconds" (periodic/recurrence)** → approximate with `G( F_[0,N](φ) )` meaning at every time point φ will occur within the next N seconds (i.e., repeated at most every N seconds). For strict periodic constraints, prefer explicit specification.
+
+2. **Temporal adverbs → guidance**:
+
+   * **Immediacy**: "immediately", "right away" → `X` (discrete next) or `F_[0,ε]` / `F_[0,0]` (exact) — prefer `X` for step-based specs.
+   * **Continuity**: "always", "continuously", "at all times" → `G_[0,∞](φ)` or `G(φ)` for unbounded.
+   * **Finality**: "eventually", "at some point" → `F_[0,∞](φ)` or `F(φ)`.
+
+**II. Implicit Temporal Feature Patterns (common design patterns)**
+
+1. **Event sequence with bounds**:
+
+   * "After A, B must happen within t1, then C within t2" → `G( A -> (F_[0,t1](B) & (B -> F_[0,t2](C))) )`.
+2. **Deadline / bounded response**:
+
+   * "If request then respond within T" → `G( request -> F_[0,T](response) )`.
+3. **Timeout detection**:
+
+   * "If X holds continuously for T, raise Y" → `G( (X & X since ...?)` — canonical: `G( (X & (previously X for T)) -> Y )` — when expressing "X holds for T after event" use `G( A -> G_[0,T](X) -> Y )` or `G( A & G_[0,T](X) -> Y )`. (Prefer explicit `G_[0,T]` patterns.)
+4. **Periodic check**:
+
+   * "Check every N seconds" → `G( F_[0,N](check) )`.
+
+**III. MTL Operator — Natural Language Correspondences & Examples**
+
+1. `G_[a,b](φ)` — "Always during [a,b]" / "for the next T seconds"
+
+   * Example: "After start, valve must remain open for 10 seconds."
+     `G( start -> G_[0,10](valve_open) )`
+2. `F_[a,b](φ)` — "Within [a,b], φ will happen" / "within T seconds"
+
+   * Example: "Respond within 5 seconds after the signal."
+     `G( signal -> F_[0,5](respond) )`
+3. `φ U_[a,b] ψ` — "φ holds until ψ within [a,b]"
+
+   * Example: "Stay in mode A until B occurs within 8 seconds."
+     `G( (in_mode_A) -> ( in_mode_A U_[0,8] B ) )`
+4. `X(φ)` — "in the next discrete step" / "immediately next"
+
+   * Example: "If alarm then clear in the next step."
+     `G( alarm -> X(clear) )`
+
+**IV. Interval syntax & numerical rules**
+
+* Use `_[a,b]` immediately after the temporal operator: `F_[a,b](p)` / `G_[a,b](p)` / `p U_[a,b] q`.
+* `a` and `b` are non-negative numbers (integers or decimals) in **seconds** unless the input explicitly uses other time units (ms, minutes, hours) — convert to seconds.
+* Use `[a,b]` inclusive by default. If natural language suggests exclusivity (e.g., "after more than 5s"), use `(5,∞)`; otherwise `[a,b]`.
+* Use `[T,∞)` for unbounded lower-bounded intervals.
+
+---
+
 **<Execution Requirements>**
-1. **Analysis in Four Steps**:
-   - **Sentence Decomposition**: Break the sentence into simplified clauses, clarifying events, conditions, temporal relationships, etc.
-   - **Keyword Identification**: Identify temporal keywords (such as "before", "globally", "whenever", etc.) and their logical relations.
-   - **Atomic Proposition Extraction**: Extract specific atomic propositions, ensuring they accurately reflect the events and their states.
-   - **Logical Structure Verification**: Validate that the temporal logic extracted is consistent, and confirm whether the LTL operators apply.
+
+1. **Analysis in Four Steps (apply every time)**:
+
+   * **Sentence Decomposition**: Break the sentence into clauses, detect events, conditions, numeric bounds, and units.
+   * **Keyword & Quantitative Identification**: Extract temporal keywords (`within`, `for`, `after`, `every`, `immediately`, `next`) and any numeric time values + units; normalize units to seconds (unless discrete steps/ticks).
+   * **Atomic Proposition Extraction**: Produce compact propositional symbols for events/conditions (e.g., `alarm`, `start`, `valve_open`). Replace phrases with single propositional tokens; keep mapping deterministic and concise.
+   * **MTL Construction & Verification**: Build the MTL formula using `F_[a,b]`, `G_[a,b]`, `U_[a,b]`, `X` and logical ops. Check that intervals make sense (non-negative, a ≤ b), units are consistent, and the formula faithfully represents the natural-language temporal constraint.
+
 2. **Simplification and Optimization**:
-   When converting to LTL formula, avoid redundant operators and ensure the formula is concise and accurate.
+
+   * Avoid redundant nested operators (e.g., collapse `F_[0,∞](F_[0,5](p))` -> `F_[0,5](p)`).
+   * Choose the tightest interval that reflects the sentence. Prefer interval-bounded operators when the sentence gives bounds.
+   * If multiple equivalent canonical forms exist, prefer the simpler, more readable one (e.g., `G( A -> F_[0,5](B) )` rather than more complex encodings).
+
+3. **Ambiguity & Defaults (do not ask the user; apply defaults)**:
+
+   * If no time unit is given, assume **seconds**.
+   * If phrase implies discrete step semantics ("next step", "in the next tick"), prefer `X`.
+   * If the sentence is ambiguous about inclusive/exclusive bounds, assume inclusive `[a,b]` unless language suggests strict inequality (e.g., "more than 5 seconds").
+
+---
+
+**[Examples]**
+
+1. Natural: "After the request, the system must respond within 10 seconds."
+   Output: ```G( request -> F_[0,10](response) )```
+
+2. Natural: "The valve shall remain open for 5 seconds after start."
+   Output: ```G( start -> G_[0,5](valve_open) )```
+
+3. Natural: "If alarm occurs, it must be cleared in the next step."
+   Output: ```G( alarm -> X(clear) )```
+
+4. Natural: "Check the sensor every 30 seconds." (interpreted as repeated at most every 30s)
+   Output: ```G( F_[0,30](check_sensor) )```
 
 ---
 
 <Question>
 Input Text: [INPUT TEXT]
+
 Analysis Process:
 Let's think step by step.
