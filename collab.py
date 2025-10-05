@@ -75,6 +75,17 @@ class SimplifiedNL2MTL:
         self.base_prompt = self._load_base_prompt()
         self.total_token_usage = TokenUsage()
         
+        # 获取处理顺序配置
+        self.process_order = self.config.get("process_order", "consensus_first")
+        if self.process_order not in ["consensus_first", "voting_first"]:
+            logger.warning(f"无效的process_order配置: {self.process_order}，使用默认值: consensus_first")
+            self.process_order = "consensus_first"
+        logger.info(f"处理顺序: {self.process_order}")
+        
+        # 获取RAG配置
+        self.rag_enabled = self.config.get("rag_enabled", True)
+        logger.info(f"RAG启用状态: {self.rag_enabled}")
+        
     def _load_config(self, config_path: str) -> Dict:
         """加载配置文件"""
         try:
@@ -194,6 +205,11 @@ class SimplifiedNL2MTL:
     
     def _get_top_examples(self, sentence: str, top_k: int = 5) -> str:
         """获取最相似的top-k个示例"""
+        # 如果RAG未启用，返回空示例
+        if not self.rag_enabled:
+            logger.info("RAG未启用，跳过示例检索")
+            return ""
+        
         if self.examples_data.empty:
             return "无可用示例"
         
@@ -788,115 +804,442 @@ class SimplifiedNL2MTL:
             processing_time=processing_time
         )
     
+    def _stage_2_voting_only(self, sentence: str, stage1_result: StageResult) -> StageResult:
+        """第二阶段：仅投票（用于voting_first流程）"""
+        start_time = time.time()
+        logger.info("=== 第二阶段：投票（投票优先流程） ===")
+        
+        # 收集第一阶段的候选答案
+        candidates = {}
+        candidate_details = {}
+        candidate_id = 1
+        
+        # 从第一阶段收集候选答案
+        for agent_name, response in stage1_result.agent_responses.items():
+            cand_key = f"候选{candidate_id}"
+            mtl_expr = self._extract_mtl_expression(response)
+            candidates[cand_key] = f"{agent_name}的独立分析: {mtl_expr}"
+            candidate_details[cand_key] = {
+                "source": f"第一阶段 - {agent_name}",
+                "mtl_expression": mtl_expr,
+                "full_response": response,
+                "summary": response[:300] + "..." if len(response) > 300 else response
+            }
+            candidate_id += 1
+        
+        # 构建投票prompt
+        voting_prompt = f"""
+请对以下MTL表达式候选项进行投票，选择最能准确表示句子含义的表达式。
+
+原句子: "{sentence}"
+
+候选答案:
+"""
+        for cand_id, cand_text in candidates.items():
+            voting_prompt += f"{cand_id}: {cand_text}\n"
+        
+        voting_prompt += """
+请仔细分析每个候选表达式，并投票选择最佳答案。
+请回复格式：我投票给：[候选ID]，理由：[投票理由]
+"""
+        
+        agent_responses = {}
+        stage_token_usage = TokenUsage()
+        
+        for agent in self.agents:
+            messages = [
+                {"role": "system", "content": agent["system_prompt"]},
+                {"role": "user", "content": voting_prompt}
+            ]
+            
+            try:
+                response, token_usage = self._call_llm(agent["name"], messages)
+                agent_responses[agent["name"]] = response
+                
+                # 累计token使用
+                stage_token_usage.prompt_tokens += token_usage.prompt_tokens
+                stage_token_usage.completion_tokens += token_usage.completion_tokens
+                stage_token_usage.total_tokens += token_usage.total_tokens
+                
+                logger.info(f"{agent['name']} 投票完成")
+                
+            except Exception as e:
+                logger.error(f"Agent {agent['name']} 投票失败: {e}")
+                agent_responses[agent["name"]] = f"投票失败: {str(e)}"
+        
+        processing_time = time.time() - start_time
+        
+        # 创建包含候选项详情的结果
+        result = StageResult(
+            stage_name="第二阶段：投票（投票优先）",
+            agent_responses=agent_responses,
+            token_usage=stage_token_usage,
+            processing_time=processing_time
+        )
+        
+        # 将候选项详情添加到结果中
+        result.candidate_details = candidate_details
+        
+        return result
+    
+    def _stage_3_discussion_after_voting(self, sentence: str, stage1_result: StageResult, stage2_result: StageResult) -> StageResult:
+        """第三阶段：基于投票结果的讨论（用于voting_first流程）"""
+        start_time = time.time()
+        logger.info("=== 第三阶段：基于投票结果的讨论 ===")
+        
+        max_rounds = 5
+        discussion_history = []
+        stage_token_usage = TokenUsage()
+        final_responses = {}
+        
+        # 构建讨论prompt，包含投票结果
+        discussion_prompt = f"""
+请参与多智能体讨论，基于之前的投票结果分析以下句子的MTL表达式。
+
+原句子: "{sentence}"
+
+各Agent的初始分析:
+"""
+        for agent_name, response in stage1_result.agent_responses.items():
+            discussion_prompt += f"\n{agent_name}: {response[:200]}...\n"
+        
+        discussion_prompt += "\n各Agent的投票结果:\n"
+        for agent_name, response in stage2_result.agent_responses.items():
+            discussion_prompt += f"\n{agent_name}: {response[:200]}...\n"
+        
+        discussion_prompt += """
+
+请基于投票结果和初始分析，通过讨论尝试达成一个最终的、最合理的MTL表达式。
+请提供你认为最准确的MTL表达式和推理过程。
+"""
+        
+        for round_num in range(max_rounds):
+            logger.info(f"讨论轮次 {round_num + 1}")
+            round_responses = {}
+            round_token_usage = TokenUsage()
+            
+            for agent in self.agents:
+                messages = [
+                    {"role": "system", "content": agent["system_prompt"]},
+                    {"role": "user", "content": discussion_prompt}
+                ]
+                
+                if discussion_history:
+                    history_text = "\n".join(discussion_history)
+                    messages.append({"role": "user", "content": f"之前的讨论:\n{history_text}\n\n请基于讨论历史继续分析："})
+                
+                try:
+                    response, token_usage = self._call_llm(agent["name"], messages)
+                    round_responses[agent["name"]] = response
+                    
+                    # 累计token使用
+                    round_token_usage.prompt_tokens += token_usage.prompt_tokens
+                    round_token_usage.completion_tokens += token_usage.completion_tokens
+                    round_token_usage.total_tokens += token_usage.total_tokens
+                    
+                except Exception as e:
+                    logger.error(f"Agent {agent['name']} 讨论失败: {e}")
+                    round_responses[agent["name"]] = f"讨论失败: {str(e)}"
+            
+            # 累计到总token使用
+            stage_token_usage.prompt_tokens += round_token_usage.prompt_tokens
+            stage_token_usage.completion_tokens += round_token_usage.completion_tokens
+            stage_token_usage.total_tokens += round_token_usage.total_tokens
+            
+            # 显示本轮讨论结果并请求人工决策
+            print(f"\n{'='*60}")
+            print(f"📝 第{round_num + 1}轮讨论结果（基于投票）")
+            print(f"{'='*60}")
+            
+            # 显示每个Agent的结论
+            self._display_discussion_summary(round_responses)
+            
+            # 记录讨论历史
+            discussion_history.append(f"第{round_num + 1}轮讨论:\n" +
+                                    "\n".join([f"{name}: {resp[:200]}..." for name, resp in round_responses.items()]))
+            
+            final_responses = round_responses
+            
+            # 如果不是最后一轮，询问是否继续
+            if round_num < max_rounds - 1:
+                decision = self._request_human_decision(f"第{round_num + 1}轮讨论完成（基于投票）", {
+                    "当前轮次": f"{round_num + 1}/{max_rounds}",
+                    "本轮处理时间": f"{(time.time() - start_time):.2f}秒",
+                    "本轮Token使用": round_token_usage.total_tokens,
+                    "累计Token使用": stage_token_usage.total_tokens
+                }, round_responses)
+                
+                if decision == HumanDecision.TERMINATE:
+                    logger.info(f"人工决策：在第{round_num + 1}轮后终止讨论")
+                    break
+                else:
+                    logger.info(f"人工决策：继续第{round_num + 2}轮讨论")
+            else:
+                logger.info("已完成最大讨论轮次")
+        
+        processing_time = time.time() - start_time
+        
+        return StageResult(
+            stage_name="第三阶段：基于投票的讨论",
+            agent_responses=final_responses,
+            token_usage=stage_token_usage,
+            processing_time=processing_time
+        )
+    
+    def _stage_4_arbitration_voting_first(self, sentence: str, stage1_result: StageResult,
+                                        stage2_result: StageResult, stage3_result: StageResult) -> StageResult:
+        """第四阶段：仲裁（用于voting_first流程）"""
+        start_time = time.time()
+        logger.info("=== 第四阶段：仲裁（投票优先流程） ===")
+        
+        # 构建仲裁prompt
+        arbitration_prompt = f"""
+作为MTL专家，请对以下复杂案例进行最终裁决。
+
+原句子: "{sentence}"
+
+处理过程总结（投票优先流程）:
+第一阶段 - 独立分析结果:
+"""
+        for agent_name, response in stage1_result.agent_responses.items():
+            arbitration_prompt += f"{agent_name}: {response[:300]}...\n"
+        
+        arbitration_prompt += "\n第二阶段 - 投票结果:\n"
+        for agent_name, response in stage2_result.agent_responses.items():
+            arbitration_prompt += f"{agent_name}: {response[:300]}...\n"
+        
+        arbitration_prompt += "\n第三阶段 - 基于投票的讨论结果:\n"
+        for agent_name, response in stage3_result.agent_responses.items():
+            arbitration_prompt += f"{agent_name}: {response[:300]}...\n"
+        
+        arbitration_prompt += """
+
+请提供最终的专家判断:
+1. 该句子的最准确的MTL表达式是什么？
+2. 为什么选择这个表达式？
+3. 投票优先流程是否产生了更好的结果？
+
+请提供详细的分析和最终的MTL表达式。
+"""
+        
+        # 使用第一个agent作为仲裁者
+        arbitrator = self.agents[0]
+        messages = [
+            {"role": "system", "content": "你是一个专业的MTL逻辑专家，负责对复杂的案例进行最终裁决。"},
+            {"role": "user", "content": arbitration_prompt}
+        ]
+        
+        stage_token_usage = TokenUsage()
+        
+        try:
+            response, token_usage = self._call_llm(arbitrator["name"], messages)
+            agent_responses = {f"仲裁者_{arbitrator['name']}": response}
+            
+            stage_token_usage = token_usage
+            logger.info("仲裁完成")
+            
+        except Exception as e:
+            logger.error(f"仲裁失败: {e}")
+            agent_responses = {"仲裁者": f"仲裁失败: {str(e)}"}
+        
+        processing_time = time.time() - start_time
+        
+        return StageResult(
+            stage_name="第四阶段：仲裁（投票优先）",
+            agent_responses=agent_responses,
+            token_usage=stage_token_usage,
+            processing_time=processing_time
+        )
+    
     def process(self, sentence: str) -> ProcessResult:
-        """完整处理流程"""
+        """完整处理流程 - 根据配置选择处理顺序"""
         start_time = time.time()
         logger.info(f"开始处理句子: {sentence}")
+        logger.info(f"使用处理顺序: {self.process_order}")
         
         # 重置token统计
         self.total_token_usage = TokenUsage()
-        stage_results = []
-        final_mtl_expression = None
-        termination_reason = "完成所有阶段"
         
         try:
             # 获取相似示例
             examples = self._get_top_examples(sentence)
             logger.info("获取相似示例完成")
             
-            # 第一阶段：独立分析
-            stage1_result = self._stage_1_independent_analysis(sentence, examples)
-            stage_results.append(stage1_result)
-            
-            # 人工决策：是否继续到第二阶段
-            decision = self._request_human_decision("第一阶段完成", {
-                "成功分析的Agent数": len([r for r in stage1_result.agent_responses.values() if "失败" not in r]),
-                "处理时间": f"{stage1_result.processing_time:.2f}秒",
-                "Token使用": stage1_result.token_usage.total_tokens
-            }, stage1_result.agent_responses)
-            stage1_result.human_decision = decision
-            
-            if decision == HumanDecision.TERMINATE:
-                termination_reason = "第一阶段后人工终止"
-                # 尝试从第一阶段提取MTL表达式
-                for response in stage1_result.agent_responses.values():
-                    mtl_match = re.search(r'```(.*?)```', response, re.DOTALL)
-                    if mtl_match:
-                        final_mtl_expression = mtl_match.group(1).strip()
-                        break
-                return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
-            
-            # 第二阶段：讨论
-            stage2_result = self._stage_2_discussion(sentence, stage1_result)
-            stage_results.append(stage2_result)
-            
-            # 人工决策：是否继续到第三阶段
-            decision = self._request_human_decision("第二阶段完成", {
-                "讨论轮次": "5轮",
-                "处理时间": f"{stage2_result.processing_time:.2f}秒",
-                "Token使用": stage2_result.token_usage.total_tokens
-            }, stage2_result.agent_responses)
-            stage2_result.human_decision = decision
-            
-            if decision == HumanDecision.TERMINATE:
-                termination_reason = "第二阶段后人工终止"
-                # 尝试从第二阶段提取MTL表达式
-                for response in stage2_result.agent_responses.values():
-                    mtl_match = re.search(r'```(.*?)```', response, re.DOTALL)
-                    if mtl_match:
-                        final_mtl_expression = mtl_match.group(1).strip()
-                        break
-                return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
-            
-            # 第三阶段：投票
-            stage3_result = self._stage_3_voting(sentence, stage1_result, stage2_result)
-            stage_results.append(stage3_result)
-            
-            # 人工决策：是否继续到第四阶段
-            decision = self._request_human_decision("第三阶段完成", {
-                "投票完成": "所有Agent已投票",
-                "处理时间": f"{stage3_result.processing_time:.2f}秒",
-                "Token使用": stage3_result.token_usage.total_tokens
-            }, stage3_result.agent_responses, stage3_result)
-            stage3_result.human_decision = decision
-            
-            if decision == HumanDecision.TERMINATE:
-                termination_reason = "第三阶段后人工终止"
-                # 尝试从投票结果提取MTL表达式
-                for response in stage3_result.agent_responses.values():
-                    mtl_match = re.search(r'```(.*?)```', response, re.DOTALL)
-                    if mtl_match:
-                        final_mtl_expression = mtl_match.group(1).strip()
-                        break
-                return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
-            
-            # 第四阶段：仲裁
-            stage4_result = self._stage_4_arbitration(sentence, stage1_result, stage2_result, stage3_result)
-            stage_results.append(stage4_result)
-            
-            # 人工决策：最终确认
-            decision = self._request_human_decision("第四阶段完成（最终）", {
-                "仲裁完成": "专家仲裁已完成",
-                "处理时间": f"{stage4_result.processing_time:.2f}秒",
-                "Token使用": stage4_result.token_usage.total_tokens
-            }, stage4_result.agent_responses)
-            stage4_result.human_decision = decision
-            
-            # 从仲裁结果提取最终MTL表达式
-            for response in stage4_result.agent_responses.values():
-                mtl_match = re.search(r'```(.*?)```', response, re.DOTALL)
-                if mtl_match:
-                    final_mtl_expression = mtl_match.group(1).strip()
-                    break
-            
-            if decision == HumanDecision.TERMINATE:
-                termination_reason = "第四阶段后人工确认终止"
+            # 根据配置选择处理流程
+            if self.process_order == "consensus_first":
+                return self._process_consensus_first(sentence, examples, start_time)
+            elif self.process_order == "voting_first":
+                return self._process_voting_first(sentence, examples, start_time)
             else:
-                termination_reason = "完成所有阶段"
-            
+                raise ValueError(f"未知的处理顺序: {self.process_order}")
+                
         except Exception as e:
             logger.error(f"处理过程出错: {e}")
-            termination_reason = f"系统错误: {str(e)}"
+            return self._create_result(sentence, start_time, [], None, f"系统错误: {str(e)}")
+    
+    def _extract_final_mtl(self, agent_responses: Dict[str, str]) -> Optional[str]:
+        """从Agent回答中提取最终MTL表达式"""
+        for response in agent_responses.values():
+            mtl_match = re.search(r'```(.*?)```', response, re.DOTALL)
+            if mtl_match:
+                return mtl_match.group(1).strip()
+        return None
+    
+    def _process_consensus_first(self, sentence: str, examples: str, start_time: float) -> ProcessResult:
+        """共识优先处理流程：独立分析 -> 讨论(共识) -> 投票 -> 仲裁"""
+        stage_results = []
+        final_mtl_expression = None
+        termination_reason = "完成所有阶段"
+        
+        # 第一阶段：独立分析
+        stage1_result = self._stage_1_independent_analysis(sentence, examples)
+        stage_results.append(stage1_result)
+        
+        # 人工决策：是否继续到第二阶段
+        decision = self._request_human_decision("第一阶段完成", {
+            "成功分析的Agent数": len([r for r in stage1_result.agent_responses.values() if "失败" not in r]),
+            "处理时间": f"{stage1_result.processing_time:.2f}秒",
+            "Token使用": stage1_result.token_usage.total_tokens
+        }, stage1_result.agent_responses)
+        stage1_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第一阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage1_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第二阶段：讨论(共识)
+        stage2_result = self._stage_2_discussion(sentence, stage1_result)
+        stage_results.append(stage2_result)
+        
+        # 人工决策：是否继续到第三阶段
+        decision = self._request_human_decision("第二阶段完成", {
+            "讨论轮次": "5轮",
+            "处理时间": f"{stage2_result.processing_time:.2f}秒",
+            "Token使用": stage2_result.token_usage.total_tokens
+        }, stage2_result.agent_responses)
+        stage2_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第二阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage2_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第三阶段：投票
+        stage3_result = self._stage_3_voting(sentence, stage1_result, stage2_result)
+        stage_results.append(stage3_result)
+        
+        # 人工决策：是否继续到第四阶段
+        decision = self._request_human_decision("第三阶段完成", {
+            "投票完成": "所有Agent已投票",
+            "处理时间": f"{stage3_result.processing_time:.2f}秒",
+            "Token使用": stage3_result.token_usage.total_tokens
+        }, stage3_result.agent_responses, stage3_result)
+        stage3_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第三阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage3_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第四阶段：仲裁
+        stage4_result = self._stage_4_arbitration(sentence, stage1_result, stage2_result, stage3_result)
+        stage_results.append(stage4_result)
+        
+        # 人工决策：最终确认
+        decision = self._request_human_decision("第四阶段完成（最终）", {
+            "仲裁完成": "专家仲裁已完成",
+            "处理时间": f"{stage4_result.processing_time:.2f}秒",
+            "Token使用": stage4_result.token_usage.total_tokens
+        }, stage4_result.agent_responses)
+        stage4_result.human_decision = decision
+        
+        # 从仲裁结果提取最终MTL表达式
+        final_mtl_expression = self._extract_final_mtl(stage4_result.agent_responses)
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第四阶段后人工确认终止"
+        else:
+            termination_reason = "完成所有阶段"
+        
+        return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+    
+    def _process_voting_first(self, sentence: str, examples: str, start_time: float) -> ProcessResult:
+        """投票优先处理流程：独立分析 -> 投票 -> 讨论(共识) -> 仲裁"""
+        stage_results = []
+        final_mtl_expression = None
+        termination_reason = "完成所有阶段"
+        
+        # 第一阶段：独立分析
+        stage1_result = self._stage_1_independent_analysis(sentence, examples)
+        stage_results.append(stage1_result)
+        
+        # 人工决策：是否继续到第二阶段
+        decision = self._request_human_decision("第一阶段完成", {
+            "成功分析的Agent数": len([r for r in stage1_result.agent_responses.values() if "失败" not in r]),
+            "处理时间": f"{stage1_result.processing_time:.2f}秒",
+            "Token使用": stage1_result.token_usage.total_tokens
+        }, stage1_result.agent_responses)
+        stage1_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第一阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage1_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第二阶段：投票（基于独立分析结果）
+        stage2_result = self._stage_2_voting_only(sentence, stage1_result)
+        stage_results.append(stage2_result)
+        
+        # 人工决策：是否继续到第三阶段
+        decision = self._request_human_decision("第二阶段完成", {
+            "投票完成": "所有Agent已投票",
+            "处理时间": f"{stage2_result.processing_time:.2f}秒",
+            "Token使用": stage2_result.token_usage.total_tokens
+        }, stage2_result.agent_responses, stage2_result)
+        stage2_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第二阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage2_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第三阶段：讨论(共识)（基于投票结果）
+        stage3_result = self._stage_3_discussion_after_voting(sentence, stage1_result, stage2_result)
+        stage_results.append(stage3_result)
+        
+        # 人工决策：是否继续到第四阶段
+        decision = self._request_human_decision("第三阶段完成", {
+            "讨论轮次": "5轮",
+            "处理时间": f"{stage3_result.processing_time:.2f}秒",
+            "Token使用": stage3_result.token_usage.total_tokens
+        }, stage3_result.agent_responses)
+        stage3_result.human_decision = decision
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第三阶段后人工终止"
+            final_mtl_expression = self._extract_final_mtl(stage3_result.agent_responses)
+            return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
+        
+        # 第四阶段：仲裁
+        stage4_result = self._stage_4_arbitration_voting_first(sentence, stage1_result, stage2_result, stage3_result)
+        stage_results.append(stage4_result)
+        
+        # 人工决策：最终确认
+        decision = self._request_human_decision("第四阶段完成（最终）", {
+            "仲裁完成": "专家仲裁已完成",
+            "处理时间": f"{stage4_result.processing_time:.2f}秒",
+            "Token使用": stage4_result.token_usage.total_tokens
+        }, stage4_result.agent_responses)
+        stage4_result.human_decision = decision
+        
+        # 从仲裁结果提取最终MTL表达式
+        final_mtl_expression = self._extract_final_mtl(stage4_result.agent_responses)
+        
+        if decision == HumanDecision.TERMINATE:
+            termination_reason = "第四阶段后人工确认终止"
+        else:
+            termination_reason = "完成所有阶段"
         
         return self._create_result(sentence, start_time, stage_results, final_mtl_expression, termination_reason)
     
