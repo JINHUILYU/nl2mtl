@@ -1,0 +1,86 @@
+{
+    "agents": [
+        {
+            "name": "Agent_A",
+            "role": "logician",
+            "model": "deepseek-chat",
+            "temperature": 0.7,
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url_env": "DEEPSEEK_API_URL"
+        },
+        {
+            "name": "Agent_B",
+            "role": "creative",
+            "model": "deepseek-chat",
+            "temperature": 0.7,
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url_env": "DEEPSEEK_API_URL"
+        },
+        {
+            "name": "Agent_C",
+            "role": "pragmatic",
+            "model": "deepseek-chat",
+            "temperature": 0.7,
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url_env": "DEEPSEEK_API_URL"
+        }
+    ],
+    "similarity_threshold": 0.95,
+    "rag_enabled": false,
+    "process_order": "consensus_first",
+    "max_discussion_rounds": 3,
+    "confidence_threshold": 0.8,
+    "human_intervention": {
+        "enabled": true,
+        "interactive_mode": true,
+        "intervention_points": ["stage_1", "stage_2", "stage_3", "stage_4"],
+        "auto_continue_threshold": 0.8,
+        "max_retries": 2,
+        "intervention_conditions": {
+            "low_confidence": 0.6,
+            "agent_failure_rate": 0.2,
+            "consensus_failure": true,
+            "voting_tie": true
+        },
+        "intervention_options": {
+            "allow_continue": true,
+            "allow_terminate": true,
+            "allow_retry": true,
+            "allow_modify_parameters": true
+        }
+    },
+    "token_tracking": {
+        "enabled": true,
+        "track_by_stage": true,
+        "track_by_agent": true,
+        "save_detailed_usage": true
+    },
+    "evaluation": {
+        "metrics": ["accuracy", "precision", "recall", "f1", "consensus_rate"],
+        "ablation_studies": {
+            "rag_ablation": true,
+            "order_ablation": true,
+            "agent_diversity_ablation": true,
+            "human_intervention_ablation": true
+        }
+    },
+    "dataset": {
+        "batch_size": 10,
+        "save_interval": 5,
+        "supported_formats": ["xlsx", "csv", "json"],
+        "human_intervention_batch_mode": "auto"
+    },
+    "logging": {
+        "level": "INFO",
+        "save_detailed_logs": true,
+        "log_file": "logs/human_intervention_nl2mtl.log",
+        "save_intervention_log": true,
+        "intervention_log_file": "logs/human_interventions.log"
+    },
+    "output": {
+        "save_token_summary": true,
+        "save_stage_details": true,
+        "save_human_decisions": true,
+        "output_format": "json"
+    }
+}
